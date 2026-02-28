@@ -24,8 +24,8 @@ function stepECA(prev, lut) {
 
 /**
  * Honor Pad 9 gamma sign fix:
- * - On your device: tilting right was producing gamma with the opposite sign.
- * So we swap left/right decision here.
+ * Your device reports gamma sign opposite to our original assumption,
+ * so we swap left/right *label decision* here.
  */
 function dominantEdgeFromTilt(beta, gamma, deadzone = 6) {
   const ab = Math.abs(beta);
@@ -33,31 +33,35 @@ function dominantEdgeFromTilt(beta, gamma, deadzone = 6) {
   if (ab < deadzone && ag < deadzone) return null;
 
   if (ag >= ab) {
-    // SWAPPED compared to before
+    // swapped for Honor
     return gamma >= 0 ? "left" : "right";
   }
   return beta >= 0 ? "top" : "bottom";
 }
 
 /**
- * Screen mapping:
- * bottom/top already correct.
- * Left/right were “falling” opposite of the label for you, so we swap the left/right mappings.
+ * Map CA coords (t,x) into a logical pixel grid (gw x gh).
+ * This controls the *visual fall direction*.
+ *
+ * You said: label is correct, but CA should move in opposite direction.
+ * So: for LEFT edge, newest time should appear at the LEFTmost side (sx=0).
+ * For RIGHT edge, newest time should appear at the RIGHTmost side (sx=gw-1).
+ *
+ * With t increasing (older->newer), we anchor:
+ * - right: sx = t (newest at gw-1)
+ * - left : sx = (gw-1 - t) (newest at 0)
  */
 function mapToScreen(edge, t, x, W, H) {
   switch (edge) {
     case "bottom":
-      return { sx: x, sy: t };
+      return { sx: x, sy: t }; // newest at bottom
     case "top":
-      return { sx: x, sy: H - 1 - t };
+      return { sx: x, sy: H - 1 - t }; // newest at top
 
-    // SWAPPED compared to before:
-    case "left":
-      // previously right’s mapping
-      return { sx: H - 1 - t, sy: x };
     case "right":
-      // previously left’s mapping
-      return { sx: t, sy: x };
+      return { sx: t, sy: x }; // newest at right
+    case "left":
+      return { sx: H - 1 - t, sy: x }; // newest at left
 
     default:
       return { sx: x, sy: t };
@@ -65,7 +69,7 @@ function mapToScreen(edge, t, x, W, H) {
 }
 
 export default function TiltEdgeECA_FillScreen() {
-  // CA size in cells
+  // CA size in cells (world size)
   const W = 400;
   const H = 260;
 
@@ -73,12 +77,14 @@ export default function TiltEdgeECA_FillScreen() {
   const canvasRef = useRef(null);
   const rafRef = useRef(null);
 
+  // --- RULE INPUT FIX (no snapping while typing) ---
   const [rule, setRule] = useState(110);
+  const [ruleText, setRuleText] = useState("110");
   const lut = useMemo(() => makeRuleLUT(rule), [rule]);
 
   const [running, setRunning] = useState(true);
 
-  // Seed mode: single vs random
+  // Seed mode
   const [seedMode, setSeedMode] = useState("single"); // "single" | "random"
 
   // Zoom multiplier
@@ -87,24 +93,25 @@ export default function TiltEdgeECA_FillScreen() {
   // HUD toggle
   const [hudOpen, setHudOpen] = useState(true);
 
-  // Motion
+  // Motion + tilt-speed
   const [motionOn, setMotionOn] = useState(false);
   const [sensorStatus, setSensorStatus] = useState("motion disabled");
-  const tiltRef = useRef({ beta: 0, gamma: 0, edge: null });
+  // include speed01 so we can drive simulation speed
+  const tiltRef = useRef({ beta: 0, gamma: 0, edge: null, speed01: 0 });
   const lastSensorTsRef = useRef(0);
 
   // Manual edge override
   const [manualEdge, setManualEdge] = useState(null);
   const [activeEdge, setActiveEdge] = useState("bottom");
 
-  // Ring buffer
+  // Ring buffer: fixed on-screen history; sim can run forever (old rows overwritten)
   const gridRef = useRef({
     rows: Array.from({ length: H }, () => new Uint8Array(W)),
     head: 0,
     current: new Uint8Array(W),
   });
 
-  // Persistent offscreen canvas + ImageData (1px per cell)
+  // Persistent offscreen canvas + ImageData (1px per cell logical grid)
   const offRef = useRef({
     canvas: null,
     ctx: null,
@@ -127,7 +134,7 @@ export default function TiltEdgeECA_FillScreen() {
     gridRef.current = { rows, head: 0, current: init };
   }
 
-  // Resize canvas to container
+  // Resize main canvas to container (dpr aware)
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
@@ -164,7 +171,6 @@ export default function TiltEdgeECA_FillScreen() {
       o.canvas.height = gh;
       o.imageData = o.ctx.createImageData(gw, gh);
     }
-
     return o;
   }
 
@@ -189,14 +195,23 @@ export default function TiltEdgeECA_FillScreen() {
     }
   }
 
-  // Sensor listeners
+  // Sensors (orientation + devicemotion proxy)
   useEffect(() => {
+    function computeSpeed01(beta, gamma) {
+      // magnitude scaled into 0..1 (tune 45 if you want faster response)
+      const mag = Math.max(Math.abs(beta), Math.abs(gamma));
+      return clamp(mag, 0, 45) / 45;
+    }
+
     function updateFrom(beta, gamma) {
       const edge = dominantEdgeFromTilt(beta, gamma);
-      tiltRef.current = { beta, gamma, edge };
+      const speed01 = computeSpeed01(beta, gamma);
+
+      tiltRef.current = { beta, gamma, edge, speed01 };
       lastSensorTsRef.current = Date.now();
+
       setSensorStatus(
-        `beta ${beta.toFixed(1)}°  gamma ${gamma.toFixed(1)}°  -> ${edge ?? "none"}`,
+        `beta ${beta.toFixed(1)}°  gamma ${gamma.toFixed(1)}°  -> ${edge ?? "none"}  speed ${(speed01 * 100).toFixed(0)}%`,
       );
     }
 
@@ -215,7 +230,7 @@ export default function TiltEdgeECA_FillScreen() {
       const x = typeof a.x === "number" ? a.x : 0;
       const y = typeof a.y === "number" ? a.y : 0;
 
-      // Proxy degrees
+      // proxy degrees
       const gamma = clamp(x * 9, -90, 90);
       const beta = clamp(y * 9, -90, 90);
 
@@ -233,6 +248,7 @@ export default function TiltEdgeECA_FillScreen() {
     };
   }, [motionOn]);
 
+  // Initial + re-run on rule/seed changes
   useEffect(() => {
     resetSimulation(seedMode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -250,6 +266,23 @@ export default function TiltEdgeECA_FillScreen() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [manualEdge]);
+
+  // Commit ruleText -> rule on blur/enter
+  function commitRuleText() {
+    // allow empty -> revert
+    if (ruleText.trim() === "") {
+      setRuleText(String(rule));
+      return;
+    }
+    const n = Number(ruleText);
+    if (!Number.isFinite(n)) {
+      setRuleText(String(rule));
+      return;
+    }
+    const r = clamp(Math.floor(n), 0, 255);
+    setRule(r);
+    setRuleText(String(r));
+  }
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -279,8 +312,13 @@ export default function TiltEdgeECA_FillScreen() {
 
       const edge = desiredEdge || activeEdge;
 
-      // Step sim
-      const stepsPerSec = 70;
+      // --- tilt-based speed ---
+      // base speed always advances; tilt increases it
+      const speed01 = motionOn ? tiltRef.current.speed01 : 0;
+      const baseStepsPerSec = 30; // stable baseline
+      const extraStepsPerSec = 140; // added at full tilt
+      const stepsPerSec = baseStepsPerSec + extraStepsPerSec * speed01;
+
       stepAccumulator += dt * stepsPerSec;
 
       if (running) {
@@ -296,7 +334,7 @@ export default function TiltEdgeECA_FillScreen() {
         stepAccumulator = Math.min(stepAccumulator, 2);
       }
 
-      // Offscreen draw
+      // Offscreen draw (logical pixels)
       const off = ensureOffscreen(edge);
       const { gw, gh, imageData } = off;
       const data = imageData.data;
@@ -330,7 +368,7 @@ export default function TiltEdgeECA_FillScreen() {
 
       off.ctx.putImageData(imageData, 0, 0);
 
-      // Always FIT (no stretch option)
+      // Always FIT scale
       const cw = canvas.width;
       const ch = canvas.height;
 
@@ -342,15 +380,36 @@ export default function TiltEdgeECA_FillScreen() {
 
       const drawW = gw * sxScale;
       const drawH = gh * syScale;
-      const dx = Math.floor((cw - drawW) / 2);
-      const dy = Math.floor((ch - drawH) / 2);
+
+      // --- EDGE ANCHORING (removes white space at the active edge) ---
+      // Instead of centering, we anchor to the “gravity” edge:
+      let dx = 0;
+      let dy = 0;
+
+      if (edge === "top") {
+        dx = Math.floor((cw - drawW) / 2);
+        dy = 0;
+      } else if (edge === "bottom") {
+        dx = Math.floor((cw - drawW) / 2);
+        dy = Math.floor(ch - drawH);
+      } else if (edge === "left") {
+        dx = 0;
+        dy = Math.floor((ch - drawH) / 2);
+      } else if (edge === "right") {
+        dx = Math.floor(cw - drawW);
+        dy = Math.floor((ch - drawH) / 2);
+      } else {
+        // fallback: center
+        dx = Math.floor((cw - drawW) / 2);
+        dy = Math.floor((ch - drawH) / 2);
+      }
 
       ctx.fillStyle = "#fff";
       ctx.fillRect(0, 0, cw, ch);
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(off.canvas, 0, 0, gw, gh, dx, dy, drawW, drawH);
 
-      // Debug overlay text (only if HUD open)
+      // Optional debug text
       if (hudOpen) {
         ctx.fillStyle = "#000";
         ctx.font = `${Math.max(12, Math.floor(12 * (window.devicePixelRatio || 1)))}px sans-serif`;
@@ -359,9 +418,9 @@ export default function TiltEdgeECA_FillScreen() {
           ? `${Math.max(0, Date.now() - lastSensorTsRef.current)}ms`
           : "n/a";
         ctx.fillText(
-          `Rule ${rule} | Edge ${edge} | motion ${motionOn ? "ON" : "OFF"} | beta ${tr.beta.toFixed(
+          `Rule ${rule} | Edge ${edge} | speed ${stepsPerSec.toFixed(0)} steps/s | beta ${tr.beta.toFixed(
             1,
-          )} gamma ${tr.gamma.toFixed(1)} | last sensor ${age}`,
+          )} gamma ${tr.gamma.toFixed(1)} | last ${age}`,
           12,
           18,
         );
@@ -387,7 +446,6 @@ export default function TiltEdgeECA_FillScreen() {
 
   return (
     <div style={{ fontFamily: "system-ui, sans-serif" }}>
-      {/* Fullscreen container so there’s no “unused bottom space” */}
       <div
         ref={containerRef}
         style={{
@@ -403,7 +461,7 @@ export default function TiltEdgeECA_FillScreen() {
           style={{ width: "100%", height: "100%", display: "block" }}
         />
 
-        {/* HUD Toggle Button (always visible) */}
+        {/* HUD Toggle */}
         <button
           onClick={() => setHudOpen((v) => !v)}
           style={{
@@ -421,7 +479,6 @@ export default function TiltEdgeECA_FillScreen() {
           {hudOpen ? "Hide HUD" : "Show HUD"}
         </button>
 
-        {/* HUD Panel */}
         {hudOpen && (
           <div
             style={{
@@ -440,16 +497,26 @@ export default function TiltEdgeECA_FillScreen() {
               maxWidth: "calc(100vw - 140px)",
             }}
           >
+            {/* RULE INPUT (text) */}
             <label>
               Rule:&nbsp;
               <input
-                type="number"
-                min={0}
-                max={255}
-                value={rule}
-                onChange={(e) =>
-                  setRule(clamp(parseInt(e.target.value || "0", 10), 0, 255))
-                }
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={ruleText}
+                onChange={(e) => {
+                  // allow only digits + empty while typing
+                  const v = e.target.value;
+                  if (/^\d*$/.test(v)) setRuleText(v);
+                }}
+                onBlur={commitRuleText}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.currentTarget.blur();
+                    commitRuleText();
+                  }
+                }}
                 style={{ width: 90 }}
               />
             </label>
@@ -459,7 +526,7 @@ export default function TiltEdgeECA_FillScreen() {
             </button>
             <button onClick={() => resetSimulation()}>Reset</button>
 
-            {/* Seed mode toggle */}
+            {/* Seed toggle */}
             <label
               style={{ display: "inline-flex", gap: 6, alignItems: "center" }}
             >
@@ -483,6 +550,7 @@ export default function TiltEdgeECA_FillScreen() {
               Random seed
             </label>
 
+            {/* Zoom */}
             <label
               style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
             >
