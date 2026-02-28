@@ -58,13 +58,14 @@ function mapToScreen(edge, t, x, W, H) {
     case "top":
       return { sx: x, sy: H - 1 - t }; // newest at top
 
-    // LEFT/RIGHT per your requirement:
     // right tilt => grows left->right (newest on right)
     case "right":
-      return { sx: t, sy: x }; // newest at right
-    // left tilt => grows right->left (newest on left)
+      // INVERTED: previously sx = t (newest on right). Now newest on LEFT.
+      return { sx: H - 1 - t, sy: x };
+
     case "left":
-      return { sx: H - 1 - t, sy: x }; // newest at left
+      // INVERTED: previously sx = H - 1 - t (newest on left). Now newest on RIGHT.
+      return { sx: t, sy: x };
 
     default:
       return { sx: x, sy: t };
@@ -451,7 +452,7 @@ export default function TiltEdgeECA_FillScreen() {
         ref={containerRef}
         style={{
           width: "100vw",
-          height: "100vh",
+          height: "100dvh",
           background: "#fff",
           position: "relative",
           overflow: "hidden",
