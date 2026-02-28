@@ -74,8 +74,14 @@ function mapToScreen(edge, t, x, W, H) {
 
 export default function TiltEdgeECA_FillScreen() {
   // CA size in cells (world size)
-  const W = 400;
-  const H = 260;
+  // World size preset (bigger = more detail when zooming out)
+  const [worldPreset, setWorldPreset] = useState("med"); // "low" | "med" | "high"
+
+  const { W, H } = useMemo(() => {
+    if (worldPreset === "low") return { W: 520, H: 360 };
+    if (worldPreset === "high") return { W: 1400, H: 900 };
+    return { W: 900, H: 600 }; // med (good for Honor Pad)
+  }, [worldPreset]);
 
   const containerRef = useRef(null);
   const canvasRef = useRef(null);
@@ -110,9 +116,9 @@ export default function TiltEdgeECA_FillScreen() {
 
   // Ring buffer: fixed on-screen history; sim can run forever (old rows overwritten)
   const gridRef = useRef({
-    rows: Array.from({ length: H }, () => new Uint8Array(W)),
+    rows: [],
     head: 0,
-    current: new Uint8Array(W),
+    current: new Uint8Array(0),
   });
 
   // Persistent offscreen canvas + ImageData (1px per cell logical grid)
@@ -137,6 +143,23 @@ export default function TiltEdgeECA_FillScreen() {
     rows[0].set(init);
     gridRef.current = { rows, head: 0, current: init };
   }
+
+  // Rebuild world buffers whenever W/H changes (for worldPreset changes)
+  useEffect(() => {
+    gridRef.current = {
+      rows: Array.from({ length: H }, () => new Uint8Array(W)),
+      head: 0,
+      current: new Uint8Array(W),
+    };
+
+    // Force offscreen realloc on next frame
+    offRef.current.gw = 0;
+    offRef.current.gh = 0;
+    offRef.current.imageData = null;
+
+    resetSimulation(seedMode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [W, H]);
 
   // Resize main canvas to container (dpr aware)
   useEffect(() => {
@@ -316,6 +339,12 @@ export default function TiltEdgeECA_FillScreen() {
 
       const edge = desiredEdge || activeEdge;
 
+      // If buffers aren't ready yet, skip this frame
+      if (!gridRef.current.current || gridRef.current.current.length !== W) {
+        rafRef.current = requestAnimationFrame(tick);
+        return;
+      }
+
       // --- tilt-based speed ---
       // base speed always advances; tilt increases it
       const speed01 = motionOn ? tiltRef.current.speed01 : 0;
@@ -372,34 +401,37 @@ export default function TiltEdgeECA_FillScreen() {
 
       off.ctx.putImageData(imageData, 0, 0);
 
-      // Always FIT scale
+      // --- Render to main canvas (camera zoom + always fill screen) ---
       const cw = canvas.width;
       const ch = canvas.height;
 
-      let sxScale = (cw / gw) * zoom;
-      let syScale = (ch / gh) * zoom;
-      const s = Math.max(sxScale, syScale); // COVER (fills screen, crops)
-      sxScale = s;
-      syScale = s;
+      // Camera zoom: larger view window = zoomed out
+      const z = zoom; // 0.25..3
+      const viewW = Math.max(1, Math.min(gw, Math.floor(gw / z)));
+      const viewH = Math.max(1, Math.min(gh, Math.floor(gh / z)));
 
-      const drawW = gw * s;
-      const drawH = gh * s;
+      // Center the view window in source
+      const sx = Math.floor((gw - viewW) / 2);
+      const sy = Math.floor((gh - viewH) / 2);
 
-      // anchor to edge (flush), crop the opposite side
-      let dx = 0,
-        dy = 0;
+      // Cover-scale destination so it ALWAYS fills the screen
+      const s = Math.max(cw / viewW, ch / viewH);
+      const drawW = viewW * s;
+      const drawH = viewH * s;
 
+      // Anchor to the active edge (flush), crop opposite side
+      let dx, dy;
       if (edge === "top") {
         dx = Math.floor((cw - drawW) / 2);
-        dy = 0; // flush top
+        dy = 0;
       } else if (edge === "bottom") {
         dx = Math.floor((cw - drawW) / 2);
-        dy = Math.floor(ch - drawH); // flush bottom
+        dy = Math.floor(ch - drawH);
       } else if (edge === "left") {
-        dx = 0; // flush left
+        dx = 0;
         dy = Math.floor((ch - drawH) / 2);
       } else if (edge === "right") {
-        dx = Math.floor(cw - drawW); // flush right
+        dx = Math.floor(cw - drawW);
         dy = Math.floor((ch - drawH) / 2);
       } else {
         dx = Math.floor((cw - drawW) / 2);
@@ -409,7 +441,9 @@ export default function TiltEdgeECA_FillScreen() {
       ctx.fillStyle = "#fff";
       ctx.fillRect(0, 0, cw, ch);
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(off.canvas, 0, 0, gw, gh, dx, dy, drawW, drawH);
+
+      // Draw cropped source region, scaled to fill screen
+      ctx.drawImage(off.canvas, sx, sy, viewW, viewH, dx, dy, drawW, drawH);
 
       // Optional debug text
       if (hudOpen) {
@@ -566,6 +600,21 @@ export default function TiltEdgeECA_FillScreen() {
                 onChange={(e) => setZoom(parseFloat(e.target.value))}
               />
               <span style={{ width: 60 }}>{zoom.toFixed(2)}x</span>
+            </label>
+
+            {/* World size */}
+            <label
+              style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
+            >
+              World:&nbsp;
+              <select
+                value={worldPreset}
+                onChange={(e) => setWorldPreset(e.target.value)}
+              >
+                <option value="low">low</option>
+                <option value="med">med</option>
+                <option value="high">high</option>
+              </select>
             </label>
 
             <button onClick={enableMotion} style={{ fontWeight: 700 }}>
