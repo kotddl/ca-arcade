@@ -22,24 +22,43 @@ function stepECA(prev, lut) {
   return next;
 }
 
+/**
+ * Honor Pad 9 gamma sign fix:
+ * - On your device: tilting right was producing gamma with the opposite sign.
+ * So we swap left/right decision here.
+ */
 function dominantEdgeFromTilt(beta, gamma, deadzone = 6) {
   const ab = Math.abs(beta);
   const ag = Math.abs(gamma);
   if (ab < deadzone && ag < deadzone) return null;
-  if (ag >= ab) return gamma >= 0 ? "right" : "left";
+
+  if (ag >= ab) {
+    // SWAPPED compared to before
+    return gamma >= 0 ? "left" : "right";
+  }
   return beta >= 0 ? "top" : "bottom";
 }
 
+/**
+ * Screen mapping:
+ * bottom/top already correct.
+ * Left/right were “falling” opposite of the label for you, so we swap the left/right mappings.
+ */
 function mapToScreen(edge, t, x, W, H) {
   switch (edge) {
     case "bottom":
       return { sx: x, sy: t };
     case "top":
       return { sx: x, sy: H - 1 - t };
+
+    // SWAPPED compared to before:
     case "left":
-      return { sx: t, sy: x };
-    case "right":
+      // previously right’s mapping
       return { sx: H - 1 - t, sy: x };
+    case "right":
+      // previously left’s mapping
+      return { sx: t, sy: x };
+
     default:
       return { sx: x, sy: t };
   }
@@ -59,11 +78,14 @@ export default function TiltEdgeECA_FillScreen() {
 
   const [running, setRunning] = useState(true);
 
-  // Fill mode: "fit" keeps aspect ratio, "stretch" fills both axes
-  const [fillMode, setFillMode] = useState("fit");
+  // Seed mode: single vs random
+  const [seedMode, setSeedMode] = useState("single"); // "single" | "random"
 
   // Zoom multiplier
   const [zoom, setZoom] = useState(1);
+
+  // HUD toggle
+  const [hudOpen, setHudOpen] = useState(true);
 
   // Motion
   const [motionOn, setMotionOn] = useState(false);
@@ -91,9 +113,10 @@ export default function TiltEdgeECA_FillScreen() {
     imageData: null,
   });
 
-  function resetSimulation({ random = false } = {}) {
+  function resetSimulation(mode = seedMode) {
     const init = new Uint8Array(W);
-    if (!random) {
+
+    if (mode === "single") {
       init[Math.floor(W / 2)] = 1;
     } else {
       for (let i = 0; i < W; i++) init[i] = Math.random() > 0.5 ? 1 : 0;
@@ -104,7 +127,7 @@ export default function TiltEdgeECA_FillScreen() {
     gridRef.current = { rows, head: 0, current: init };
   }
 
-  // Resize canvas to container (crucial for avoiding “0x0 black screen”)
+  // Resize canvas to container
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
@@ -113,6 +136,7 @@ export default function TiltEdgeECA_FillScreen() {
     const ro = new ResizeObserver(() => {
       const rect = container.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
+
       canvas.width = Math.max(1, Math.floor(rect.width * dpr));
       canvas.height = Math.max(1, Math.floor(rect.height * dpr));
       canvas.style.width = `${rect.width}px`;
@@ -146,7 +170,6 @@ export default function TiltEdgeECA_FillScreen() {
 
   async function enableMotion() {
     try {
-      // Some browsers expose this (not usually Android Chrome, but safe)
       if (
         typeof DeviceOrientationEvent !== "undefined" &&
         typeof DeviceOrientationEvent.requestPermission === "function"
@@ -158,7 +181,6 @@ export default function TiltEdgeECA_FillScreen() {
           return;
         }
       }
-
       setMotionOn(true);
       setSensorStatus("listening… tilt the tablet");
     } catch {
@@ -167,7 +189,7 @@ export default function TiltEdgeECA_FillScreen() {
     }
   }
 
-  // Sensor listeners: orientation + motion (some devices only provide one reliably)
+  // Sensor listeners
   useEffect(() => {
     function updateFrom(beta, gamma) {
       const edge = dominantEdgeFromTilt(beta, gamma);
@@ -187,22 +209,16 @@ export default function TiltEdgeECA_FillScreen() {
 
     function onMotion(e) {
       if (!motionOn) return;
-      // devicemotion gives acceleration/rotation; we can approximate “tilt” from gravity-ish acceleration
-      // If accelerationIncludingGravity is present, it’s often the most usable.
       const a = e.accelerationIncludingGravity;
       if (!a) return;
 
-      // Convert to a rough beta/gamma proxy (not perfect, but enough to detect left/right/up/down tilt)
-      // x: left/right, y: up/down, z: towards sky
       const x = typeof a.x === "number" ? a.x : 0;
       const y = typeof a.y === "number" ? a.y : 0;
-      const z = typeof a.z === "number" ? a.z : 0;
 
-      // Simple mapping into degrees-ish range
+      // Proxy degrees
       const gamma = clamp(x * 9, -90, 90);
       const beta = clamp(y * 9, -90, 90);
 
-      // If z is near 0, device may be flat/weird; still OK
       updateFrom(beta, gamma);
     }
 
@@ -218,19 +234,19 @@ export default function TiltEdgeECA_FillScreen() {
   }, [motionOn]);
 
   useEffect(() => {
-    resetSimulation({ random: false });
+    resetSimulation(seedMode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    resetSimulation({ random: false });
+    resetSimulation(seedMode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rule]);
+  }, [rule, seedMode]);
 
   useEffect(() => {
     if (manualEdge && manualEdge !== activeEdge) {
       setActiveEdge(manualEdge);
-      resetSimulation({ random: false });
+      resetSimulation(seedMode);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [manualEdge]);
@@ -248,7 +264,6 @@ export default function TiltEdgeECA_FillScreen() {
       const dt = (now - lastT) / 1000;
       lastT = now;
 
-      // If canvas is 0x0 for any reason, avoid drawing (prevents black “stuck” states)
       if (canvas.width < 2 || canvas.height < 2) {
         rafRef.current = requestAnimationFrame(tick);
         return;
@@ -259,7 +274,7 @@ export default function TiltEdgeECA_FillScreen() {
 
       if (desiredEdge && desiredEdge !== activeEdge) {
         setActiveEdge(desiredEdge);
-        resetSimulation({ random: false });
+        resetSimulation(seedMode);
       }
 
       const edge = desiredEdge || activeEdge;
@@ -281,7 +296,7 @@ export default function TiltEdgeECA_FillScreen() {
         stepAccumulator = Math.min(stepAccumulator, 2);
       }
 
-      // Offscreen draw (1px per cell)
+      // Offscreen draw
       const off = ensureOffscreen(edge);
       const { gw, gh, imageData } = off;
       const data = imageData.data;
@@ -301,8 +316,10 @@ export default function TiltEdgeECA_FillScreen() {
         const row = g.rows[bufIdx];
         for (let x = 0; x < W; x++) {
           if (row[x] !== 1) continue;
+
           const { sx, sy } = mapToScreen(edge, t, x, W, H);
           if (sx < 0 || sx >= gw || sy < 0 || sy >= gh) continue;
+
           const p = (sy * gw + sx) * 4;
           data[p] = 0;
           data[p + 1] = 0;
@@ -311,20 +328,17 @@ export default function TiltEdgeECA_FillScreen() {
         }
       }
 
-      // Paint scaled to main canvas
       off.ctx.putImageData(imageData, 0, 0);
 
+      // Always FIT (no stretch option)
       const cw = canvas.width;
       const ch = canvas.height;
 
       let sxScale = (cw / gw) * zoom;
       let syScale = (ch / gh) * zoom;
-
-      if (fillMode === "fit") {
-        const s = Math.min(sxScale, syScale);
-        sxScale = s;
-        syScale = s;
-      }
+      const s = Math.min(sxScale, syScale);
+      sxScale = s;
+      syScale = s;
 
       const drawW = gw * sxScale;
       const drawH = gh * syScale;
@@ -336,130 +350,177 @@ export default function TiltEdgeECA_FillScreen() {
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(off.canvas, 0, 0, gw, gh, dx, dy, drawW, drawH);
 
-      // Debug HUD (also helps confirm sensors alive)
-      ctx.fillStyle = "#000";
-      ctx.font = `${Math.max(12, Math.floor(12 * (window.devicePixelRatio || 1)))}px sans-serif`;
-      const tr = tiltRef.current;
-      const age = motionOn
-        ? `${Math.max(0, Date.now() - lastSensorTsRef.current)}ms`
-        : "n/a";
-      ctx.fillText(
-        `Rule ${rule} | Edge ${edge} | motion ${motionOn ? "ON" : "OFF"} | beta ${tr.beta.toFixed(
-          1,
-        )} gamma ${tr.gamma.toFixed(1)} | last sensor ${age}`,
-        12,
-        18,
-      );
+      // Debug overlay text (only if HUD open)
+      if (hudOpen) {
+        ctx.fillStyle = "#000";
+        ctx.font = `${Math.max(12, Math.floor(12 * (window.devicePixelRatio || 1)))}px sans-serif`;
+        const tr = tiltRef.current;
+        const age = motionOn
+          ? `${Math.max(0, Date.now() - lastSensorTsRef.current)}ms`
+          : "n/a";
+        ctx.fillText(
+          `Rule ${rule} | Edge ${edge} | motion ${motionOn ? "ON" : "OFF"} | beta ${tr.beta.toFixed(
+            1,
+          )} gamma ${tr.gamma.toFixed(1)} | last sensor ${age}`,
+          12,
+          18,
+        );
+      }
 
       rafRef.current = requestAnimationFrame(tick);
     }
 
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [activeEdge, fillMode, H, lut, manualEdge, motionOn, rule, running, zoom]);
+  }, [
+    activeEdge,
+    H,
+    lut,
+    manualEdge,
+    motionOn,
+    rule,
+    running,
+    zoom,
+    hudOpen,
+    seedMode,
+  ]);
 
   return (
-    <div style={{ fontFamily: "system-ui, sans-serif", padding: 12 }}>
-      <div
-        style={{
-          display: "flex",
-          gap: 12,
-          flexWrap: "wrap",
-          alignItems: "center",
-        }}
-      >
-        <label>
-          Rule:&nbsp;
-          <input
-            type="number"
-            min={0}
-            max={255}
-            value={rule}
-            onChange={(e) =>
-              setRule(clamp(parseInt(e.target.value || "0", 10), 0, 255))
-            }
-            style={{ width: 90 }}
-          />
-        </label>
-
-        <button onClick={() => setRunning((v) => !v)}>
-          {running ? "Pause" : "Play"}
-        </button>
-        <button onClick={() => resetSimulation({ random: false })}>
-          Reset
-        </button>
-
-        <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-          Fill:&nbsp;
-          <select
-            value={fillMode}
-            onChange={(e) => setFillMode(e.target.value)}
-          >
-            <option value="fit">fit</option>
-            <option value="stretch">stretch</option>
-          </select>
-        </label>
-
-        <label style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-          Zoom:&nbsp;
-          <input
-            type="range"
-            min={0.25}
-            max={3}
-            step={0.05}
-            value={zoom}
-            onChange={(e) => setZoom(parseFloat(e.target.value))}
-          />
-          <span style={{ width: 60 }}>{zoom.toFixed(2)}x</span>
-        </label>
-
-        <button onClick={enableMotion} style={{ fontWeight: 700 }}>
-          Enable Motion
-        </button>
-        <span style={{ opacity: 0.8 }}>{sensorStatus}</span>
-      </div>
-
-      <div
-        style={{
-          marginTop: 10,
-          display: "flex",
-          gap: 8,
-          flexWrap: "wrap",
-          alignItems: "center",
-        }}
-      >
-        <span style={{ opacity: 0.8 }}>Manual edge:</span>
-        <button
-          onClick={() => setManualEdge(null)}
-          style={{ fontWeight: manualEdge === null ? 700 : 400 }}
-        >
-          Auto
-        </button>
-        {["left", "right", "top", "bottom"].map((e) => (
-          <button
-            key={e}
-            onClick={() => setManualEdge(e)}
-            style={{ fontWeight: manualEdge === e ? 700 : 400 }}
-          >
-            {e}
-          </button>
-        ))}
-      </div>
-
+    <div style={{ fontFamily: "system-ui, sans-serif" }}>
+      {/* Fullscreen container so there’s no “unused bottom space” */}
       <div
         ref={containerRef}
         style={{
-          marginTop: 12,
-          border: "1px solid #ddd",
-          width: "100%",
-          height: "70vh",
+          width: "100vw",
+          height: "100vh",
           background: "#fff",
+          position: "relative",
+          overflow: "hidden",
         }}
       >
         <canvas
           ref={canvasRef}
           style={{ width: "100%", height: "100%", display: "block" }}
         />
+
+        {/* HUD Toggle Button (always visible) */}
+        <button
+          onClick={() => setHudOpen((v) => !v)}
+          style={{
+            position: "absolute",
+            top: 12,
+            right: 12,
+            zIndex: 10,
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "1px solid #ddd",
+            background: "rgba(255,255,255,0.9)",
+            fontWeight: 700,
+          }}
+        >
+          {hudOpen ? "Hide HUD" : "Show HUD"}
+        </button>
+
+        {/* HUD Panel */}
+        {hudOpen && (
+          <div
+            style={{
+              position: "absolute",
+              top: 12,
+              left: 12,
+              zIndex: 10,
+              padding: 12,
+              borderRadius: 12,
+              border: "1px solid #ddd",
+              background: "rgba(255,255,255,0.9)",
+              display: "flex",
+              gap: 10,
+              flexWrap: "wrap",
+              alignItems: "center",
+              maxWidth: "calc(100vw - 140px)",
+            }}
+          >
+            <label>
+              Rule:&nbsp;
+              <input
+                type="number"
+                min={0}
+                max={255}
+                value={rule}
+                onChange={(e) =>
+                  setRule(clamp(parseInt(e.target.value || "0", 10), 0, 255))
+                }
+                style={{ width: 90 }}
+              />
+            </label>
+
+            <button onClick={() => setRunning((v) => !v)}>
+              {running ? "Pause" : "Play"}
+            </button>
+            <button onClick={() => resetSimulation()}>Reset</button>
+
+            {/* Seed mode toggle */}
+            <label
+              style={{ display: "inline-flex", gap: 6, alignItems: "center" }}
+            >
+              <input
+                type="radio"
+                name="seedMode"
+                checked={seedMode === "single"}
+                onChange={() => setSeedMode("single")}
+              />
+              Single seed
+            </label>
+            <label
+              style={{ display: "inline-flex", gap: 6, alignItems: "center" }}
+            >
+              <input
+                type="radio"
+                name="seedMode"
+                checked={seedMode === "random"}
+                onChange={() => setSeedMode("random")}
+              />
+              Random seed
+            </label>
+
+            <label
+              style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
+            >
+              Zoom:&nbsp;
+              <input
+                type="range"
+                min={0.25}
+                max={3}
+                step={0.05}
+                value={zoom}
+                onChange={(e) => setZoom(parseFloat(e.target.value))}
+              />
+              <span style={{ width: 60 }}>{zoom.toFixed(2)}x</span>
+            </label>
+
+            <button onClick={enableMotion} style={{ fontWeight: 700 }}>
+              Enable Motion
+            </button>
+            <span style={{ opacity: 0.8 }}>{sensorStatus}</span>
+
+            <span style={{ opacity: 0.8 }}>Manual edge:</span>
+            <button
+              onClick={() => setManualEdge(null)}
+              style={{ fontWeight: manualEdge === null ? 700 : 400 }}
+            >
+              Auto
+            </button>
+            {["left", "right", "top", "bottom"].map((e) => (
+              <button
+                key={e}
+                onClick={() => setManualEdge(e)}
+                style={{ fontWeight: manualEdge === e ? 700 : 400 }}
+              >
+                {e}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
