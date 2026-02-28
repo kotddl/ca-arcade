@@ -58,8 +58,11 @@ function mapToScreen(edge, t, x, W, H) {
     case "top":
       return { sx: x, sy: H - 1 - t }; // newest at top
 
+    // LEFT/RIGHT per your requirement:
+    // right tilt => grows left->right (newest on right)
     case "right":
       return { sx: t, sy: x }; // newest at right
+    // left tilt => grows right->left (newest on left)
     case "left":
       return { sx: H - 1 - t, sy: x }; // newest at left
 
@@ -374,32 +377,30 @@ export default function TiltEdgeECA_FillScreen() {
 
       let sxScale = (cw / gw) * zoom;
       let syScale = (ch / gh) * zoom;
-      const s = Math.min(sxScale, syScale);
+      const s = Math.max(sxScale, syScale); // COVER (fills screen, crops)
       sxScale = s;
       syScale = s;
 
-      const drawW = gw * sxScale;
-      const drawH = gh * syScale;
+      const drawW = gw * s;
+      const drawH = gh * s;
 
-      // --- EDGE ANCHORING (removes white space at the active edge) ---
-      // Instead of centering, we anchor to the “gravity” edge:
-      let dx = 0;
-      let dy = 0;
+      // anchor to edge (flush), crop the opposite side
+      let dx = 0,
+        dy = 0;
 
       if (edge === "top") {
         dx = Math.floor((cw - drawW) / 2);
-        dy = 0;
+        dy = 0; // flush top
       } else if (edge === "bottom") {
         dx = Math.floor((cw - drawW) / 2);
-        dy = Math.floor(ch - drawH);
+        dy = Math.floor(ch - drawH); // flush bottom
       } else if (edge === "left") {
-        dx = 0;
+        dx = 0; // flush left
         dy = Math.floor((ch - drawH) / 2);
       } else if (edge === "right") {
-        dx = Math.floor(cw - drawW);
+        dx = Math.floor(cw - drawW); // flush right
         dy = Math.floor((ch - drawH) / 2);
       } else {
-        // fallback: center
         dx = Math.floor((cw - drawW) / 2);
         dy = Math.floor((ch - drawH) / 2);
       }
