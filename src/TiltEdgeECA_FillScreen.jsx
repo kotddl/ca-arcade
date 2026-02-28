@@ -51,21 +51,22 @@ function dominantEdgeFromTilt(beta, gamma, deadzone = 6) {
  * - right: sx = t (newest at gw-1)
  * - left : sx = (gw-1 - t) (newest at 0)
  */
-function mapToScreen(edge, t, x, W, H) {
+function mapToScreen(edge, t, x, W, H, flipLR = false) {
   switch (edge) {
     case "bottom":
-      return { sx: x, sy: t }; // newest at bottom
+      return { sx: x, sy: t };
     case "top":
-      return { sx: x, sy: H - 1 - t }; // newest at top
+      return { sx: x, sy: H - 1 - t };
 
-    // right tilt => grows left->right (newest on right)
     case "right":
-      // INVERTED: previously sx = t (newest on right). Now newest on LEFT.
-      return { sx: H - 1 - t, sy: x };
+      // current behavior (Android/Honor): newest on LEFT
+      // iOS wants the opposite: newest on RIGHT
+      return flipLR ? { sx: t, sy: x } : { sx: H - 1 - t, sy: x };
 
     case "left":
-      // INVERTED: previously sx = H - 1 - t (newest on left). Now newest on RIGHT.
-      return { sx: t, sy: x };
+      // current behavior (Android/Honor): newest on RIGHT
+      // iOS wants the opposite: newest on LEFT
+      return flipLR ? { sx: H - 1 - t, sy: x } : { sx: t, sy: x };
 
     default:
       return { sx: x, sy: t };
@@ -129,6 +130,15 @@ export default function TiltEdgeECA_FillScreen() {
     gh: 0,
     imageData: null,
   });
+
+  const isIOS = useMemo(() => {
+    if (typeof navigator === "undefined") return false;
+    return (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      // iPadOS can masquerade as Mac; this catches it
+      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+    );
+  }, []);
 
   function resetSimulation(mode = seedMode) {
     const init = new Uint8Array(W);
@@ -388,7 +398,7 @@ export default function TiltEdgeECA_FillScreen() {
         for (let x = 0; x < W; x++) {
           if (row[x] !== 1) continue;
 
-          const { sx, sy } = mapToScreen(edge, t, x, W, H);
+          const { sx, sy } = mapToScreen(edge, t, x, W, H, isIOS);
           if (sx < 0 || sx >= gw || sy < 0 || sy >= gh) continue;
 
           const p = (sy * gw + sx) * 4;
