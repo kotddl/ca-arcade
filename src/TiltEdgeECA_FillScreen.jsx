@@ -1,21 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-/**
- * Tilt-edge ECA — Fullscreen + Tilt-speed + Zoom
- *
- * Changes vs your last version:
- * 1) Fills the whole screen: W/H are derived from the viewport + cellSize.
- * 2) Tilt controls speed: more tilt => more steps/sec.
- * 3) Zoom out/in: changes cellSize (smaller cells => more columns/rows visible).
- * 4) Rule 110 "triangle" issue: you now have seed modes.
- *    - Single seed (good for Rule 90 style structure)
- *    - Center + sprinkle noise (keeps a clear origin but activates more of the width)
- *    - Random (fully dense)
- *
- * NOTE: This does NOT wrap boundaries or auto-expand.
- * Boundaries are fixed zeros; we simply choose an initial condition that can fill the screen.
- */
-
 function clamp(x, a, b) {
   return Math.max(a, Math.min(b, x));
 }
@@ -25,9 +9,7 @@ function makeRuleLUT(rule) {
   return new Array(8).fill(0).map((_, i) => (rule >> i) & 1);
 }
 
-/**
- * Non-wrapping ECA step (fixed boundaries): out-of-bounds treated as 0.
- */
+// Fixed boundary (no wrap): out-of-bounds treated as 0
 function stepECA(prev, lut) {
   const n = prev.length;
   const next = new Uint8Array(n);
@@ -49,13 +31,8 @@ function dominantEdgeFromTilt(beta, gamma, deadzone = 6) {
   return beta >= 0 ? "top" : "bottom";
 }
 
-function speed01FromTilt(beta, gamma) {
-  // 0..1 based on max tilt magnitude, clamped.
-  const mag = Math.max(Math.abs(beta), Math.abs(gamma));
-  return clamp(mag, 0, 45) / 45;
-}
-
-// Map CA coordinates (t,x) -> screen grid coords (sx,sy) depending on edge.
+// Map CA coordinates (t,x) -> screen-grid coords (sx,sy) depending on edge.
+// Here, “screen-grid” is the logical grid we draw into at 1px per cell.
 function mapToScreen(edge, t, x, W, H) {
   switch (edge) {
     case "bottom":
@@ -71,13 +48,12 @@ function mapToScreen(edge, t, x, W, H) {
   }
 }
 
-function defaultSeedModeForRule(rule) {
-  if (rule === 90) return "single";
-  if (rule === 110) return "centerSprinkle";
-  return "centerSprinkle";
-}
+export default function TiltEdgeECA_FillScreen() {
+  // CA size in cells (increase W/H if you want “more world”, zoom controls show more/less)
+  const W = 400; // space width in cells
+  const H = 260; // history depth in rows (time)
 
-export default function TiltEdgeECAFullscreen() {
+  const containerRef = useRef(null);
   const canvasRef = useRef(null);
   const rafRef = useRef(null);
 
@@ -85,142 +61,123 @@ export default function TiltEdgeECAFullscreen() {
   const lut = useMemo(() => makeRuleLUT(rule), [rule]);
 
   const [running, setRunning] = useState(true);
-  const [motionOn, setMotionOn] = useState(true);
-  const tiltRef = useRef({ beta: 0, gamma: 0, edge: null, speed01: 0 });
 
-  const [manualEdge, setManualEdge] = useState(null); // "left"|"right"|"top"|"bottom"|null
+  // Fill mode: "fit" preserves aspect ratio (letterbox), "stretch" fills both axes (distorts)
+  const [fillMode, setFillMode] = useState("fit");
+
+  // Zoom multiplier applied on top of fit/stretch scale
+  const [zoom, setZoom] = useState(1);
+
+  // Motion steering
+  const [motionOn, setMotionOn] = useState(true);
+  const tiltRef = useRef({ beta: 0, gamma: 0, edge: null });
+
+  // Manual edge override
+  const [manualEdge, setManualEdge] = useState(null);
   const [activeEdge, setActiveEdge] = useState("bottom");
 
-  // Zoom: smaller cellSize => more cells visible (zoom out)
-  const [cellSize, setCellSize] = useState(2);
+  // Ring buffer for CA rows
+  const gridRef = useRef({
+    rows: Array.from({ length: H }, () => new Uint8Array(W)),
+    head: 0,
+    current: new Uint8Array(W),
+  });
 
-  // Seed modes to help Rule 110 fill the screen
-  const [seedMode, setSeedMode] = useState(defaultSeedModeForRule(110));
-  const [sprinkleProb, setSprinkleProb] = useState(0.02); // for centerSprinkle
+  // Offscreen pixel buffer (1px per cell)
+  // Logical grid dims depend on edge (time horizontal swaps axes)
+  const offscreenRef = useRef({
+    w: W,
+    h: H,
+    imageData: null, // ImageData
+  });
 
-  // Viewport-derived CA dimensions (W=space width, H=time depth)
-  const dimsRef = useRef({ W: 0, H: 0 });
-
-  // Simulation grid: circular buffer of rows
-  const gridRef = useRef({ rows: [], head: 0, current: new Uint8Array(0) });
-
-  function computeDims(edge, cs) {
-    const vw = Math.max(1, window.innerWidth);
-    const vh = Math.max(1, window.innerHeight);
-
-    const timeHorizontal = edge === "left" || edge === "right";
-    const gridW = Math.max(8, Math.floor(vw / cs));
-    const gridH = Math.max(8, Math.floor(vh / cs));
-
-    // timeHorizontal: displayed width is H and height is W
-    const W = timeHorizontal ? gridH : gridW;
-    const H = timeHorizontal ? gridW : gridH;
-
-    return { W, H, timeHorizontal };
-  }
-
-  function buildInitRow(W, mode, sprinkleP) {
+  function resetSimulation({ random = false } = {}) {
     const init = new Uint8Array(W);
-
-    if (mode === "single") {
+    if (!random) {
       init[Math.floor(W / 2)] = 1;
-      return init;
+    } else {
+      for (let i = 0; i < W; i++) init[i] = Math.random() > 0.5 ? 1 : 0;
     }
 
-    if (mode === "centerSprinkle") {
-      init[Math.floor(W / 2)] = 1;
-      for (let i = 0; i < W; i++) {
-        if (Math.random() < sprinkleP) init[i] = 1;
-      }
-      return init;
-    }
-
-    // random
-    for (let i = 0; i < W; i++) init[i] = Math.random() > 0.5 ? 1 : 0;
-    return init;
-  }
-
-  function resetSimulation({ edgeOverride = null, keepDims = false } = {}) {
-    const edge =
-      edgeOverride ??
-      (manualEdge ?? (motionOn ? tiltRef.current.edge : null) ?? activeEdge);
-
-    const { W, H } = keepDims
-      ? { W: dimsRef.current.W, H: dimsRef.current.H }
-      : computeDims(edge || activeEdge, cellSize);
-
-    dimsRef.current = { W, H };
-
-    const init = buildInitRow(W, seedMode, sprinkleProb);
     const rows = Array.from({ length: H }, () => new Uint8Array(W));
     rows[0].set(init);
 
     gridRef.current = { rows, head: 0, current: init };
-
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const timeHorizontal =
-        (edge || activeEdge) === "left" || (edge || activeEdge) === "right";
-      canvas.width = (timeHorizontal ? H : W) * cellSize;
-      canvas.height = (timeHorizontal ? W : H) * cellSize;
-    }
   }
 
-  // Device orientation listener (Android)
+  // Device orientation listener
   useEffect(() => {
     function onOri(e) {
       const beta = typeof e.beta === "number" ? e.beta : 0;
       const gamma = typeof e.gamma === "number" ? e.gamma : 0;
       const edge = dominantEdgeFromTilt(beta, gamma);
-      const speed01 = speed01FromTilt(beta, gamma);
-      tiltRef.current = { beta, gamma, edge, speed01 };
+      tiltRef.current = { beta, gamma, edge };
     }
-
     window.addEventListener("deviceorientation", onOri, true);
     return () => window.removeEventListener("deviceorientation", onOri, true);
   }, []);
 
-  // Reset on rule/zoom/sprinkle changes
   useEffect(() => {
-    resetSimulation();
+    resetSimulation({ random: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rule, cellSize, sprinkleProb]);
+  }, []);
 
-  // Reset when seed mode changes
   useEffect(() => {
-    resetSimulation();
+    resetSimulation({ random: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seedMode]);
+  }, [rule]);
 
-  // Reset when manual edge changes
+  // Resize canvas to container
   useEffect(() => {
-    if (manualEdge && manualEdge !== activeEdge) {
-      setActiveEdge(manualEdge);
-      resetSimulation({ edgeOverride: manualEdge });
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
+
+    const ro = new ResizeObserver(() => {
+      const rect = container.getBoundingClientRect();
+      // devicePixelRatio for crispness
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+    });
+
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, []);
+
+  function ensureOffscreen(edge) {
+    // Logical grid dims:
+    // bottom/top: (W x H)
+    // left/right: (H x W)
+    const gw = edge === "left" || edge === "right" ? H : W;
+    const gh = edge === "left" || edge === "right" ? W : H;
+
+    const o = offscreenRef.current;
+    if (!o.imageData || o.w !== gw || o.h !== gh) {
+      // Create ImageData (RGBA) of gw x gh
+      const tmp = document.createElement("canvas");
+      const tctx = tmp.getContext("2d");
+      o.w = gw;
+      o.h = gh;
+      o.imageData = tctx.createImageData(gw, gh);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [manualEdge]);
-
-  // Recompute dims on window resize
-  useEffect(() => {
-    function onResize() {
-      resetSimulation({ keepDims: false });
-    }
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cellSize, seedMode, sprinkleProb, rule, motionOn, manualEdge, activeEdge]);
+    return { gw, gh, imageData: offscreenRef.current.imageData };
+  }
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d", { alpha: false });
 
+    ctx.imageSmoothingEnabled = false;
+
     let lastT = performance.now();
     let stepAccumulator = 0;
 
     function tick(now) {
-      const dt = Math.min(0.05, (now - lastT) / 1000);
+      const dt = (now - lastT) / 1000;
       lastT = now;
 
       const desiredEdge =
@@ -228,165 +185,184 @@ export default function TiltEdgeECAFullscreen() {
 
       if (desiredEdge && desiredEdge !== activeEdge) {
         setActiveEdge(desiredEdge);
-        resetSimulation({ edgeOverride: desiredEdge });
+        resetSimulation({ random: false });
       }
 
       const edge = desiredEdge || activeEdge;
 
-      // Ensure dims still match viewport + zoom + edge
-      const { W, H } = dimsRef.current;
-      const { W: W2, H: H2 } = computeDims(edge, cellSize);
-      if (W !== W2 || H !== H2) resetSimulation({ edgeOverride: edge });
-
-      // Tilt-based speed
-      const s01 = tiltRef.current.speed01;
-      const minSps = 30;
-      const maxSps = 800;
-      const stepsPerSec = minSps + (maxSps - minSps) * Math.pow(s01, 1.35);
+      // Step sim
+      const stepsPerSec = 70;
+      stepAccumulator += dt * stepsPerSec;
 
       if (running) {
-        stepAccumulator += dt * stepsPerSec;
-        const steps = Math.max(1, Math.floor(stepAccumulator));
-        stepAccumulator -= steps;
+        while (stepAccumulator >= 1) {
+          stepAccumulator -= 1;
 
-        for (let s = 0; s < steps; s++) {
           const g = gridRef.current;
           const next = stepECA(g.current, lut);
           g.current = next;
-          g.head = (g.head + 1) % g.rows.length;
+          g.head = (g.head + 1) % H;
           g.rows[g.head].set(next);
         }
+      } else {
+        // keep accumulator bounded
+        stepAccumulator = Math.min(stepAccumulator, 2);
       }
 
-      // Draw
-      ctx.fillStyle = "#fff";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#000";
+      // Offscreen draw at 1px per cell
+      const { gw, gh, imageData } = ensureOffscreen(edge);
+      const data = imageData.data;
+
+      // Clear to white
+      for (let i = 0; i < data.length; i += 4) {
+        data[i] = 255;
+        data[i + 1] = 255;
+        data[i + 2] = 255;
+        data[i + 3] = 255;
+      }
 
       const g = gridRef.current;
-      const { W: w, H: h } = dimsRef.current;
-
-      for (let t = 0; t < h; t++) {
-        const bufIdx = (g.head - (h - 1 - t) + h) % h;
+      for (let t = 0; t < H; t++) {
+        const bufIdx = (g.head - (H - 1 - t) + H) % H;
         const row = g.rows[bufIdx];
-        for (let x = 0; x < w; x++) {
+
+        for (let x = 0; x < W; x++) {
           if (row[x] !== 1) continue;
-          const { sx, sy } = mapToScreen(edge, t, x, w, h);
-          const gridWidth = edge === "left" || edge === "right" ? h : w;
-          const gridHeight = edge === "left" || edge === "right" ? w : h;
-          if (sx < 0 || sx >= gridWidth || sy < 0 || sy >= gridHeight) continue;
-          ctx.fillRect(sx * cellSize, sy * cellSize, cellSize, cellSize);
+
+          const { sx, sy } = mapToScreen(edge, t, x, W, H);
+          if (sx < 0 || sx >= gw || sy < 0 || sy >= gh) continue;
+
+          const p = (sy * gw + sx) * 4;
+          data[p] = 0;
+          data[p + 1] = 0;
+          data[p + 2] = 0;
+          data[p + 3] = 255;
         }
       }
+
+      // Put ImageData into a tiny temp canvas, then scale to main canvas
+      const tmp = document.createElement("canvas");
+      tmp.width = gw;
+      tmp.height = gh;
+      const tctx = tmp.getContext("2d");
+      tctx.putImageData(imageData, 0, 0);
+
+      // Compute scale to fill the canvas
+      const cw = canvas.width;
+      const ch = canvas.height;
+
+      let sxScale = (cw / gw) * zoom;
+      let syScale = (ch / gh) * zoom;
+
+      if (fillMode === "fit") {
+        const s = Math.min(sxScale, syScale);
+        sxScale = s;
+        syScale = s;
+      }
+
+      const drawW = gw * sxScale;
+      const drawH = gh * syScale;
+      const dx = Math.floor((cw - drawW) / 2);
+      const dy = Math.floor((ch - drawH) / 2);
+
+      // Clear & draw
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, cw, ch);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(tmp, 0, 0, gw, gh, dx, dy, drawW, drawH);
+
+      // HUD
+      ctx.fillStyle = "#000";
+      ctx.font = `${Math.max(12, Math.floor(12 * (window.devicePixelRatio || 1)))}px sans-serif`;
+      ctx.fillText(
+        `Rule ${rule} | Edge ${edge} | ${fillMode} | zoom ${zoom.toFixed(2)}`,
+        12,
+        18
+      );
 
       rafRef.current = requestAnimationFrame(tick);
     }
 
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lut, running, motionOn, manualEdge, activeEdge, cellSize, rule, seedMode, sprinkleProb]);
+  }, [activeEdge, fillMode, lut, manualEdge, motionOn, rule, running, zoom]);
 
   return (
-    <div style={{ width: "100vw", height: "100vh", margin: 0, overflow: "hidden", background: "#fff" }}>
-      <canvas
-        ref={canvasRef}
-        style={{
-          position: "fixed",
-          inset: 0,
-          width: "100vw",
-          height: "100vh",
-          display: "block",
-          touchAction: "none",
-        }}
-      />
-
-      {/* Controls overlay */}
-      <div
-        style={{
-          position: "fixed",
-          left: 12,
-          bottom: 12,
-          display: "flex",
-          gap: 10,
-          flexWrap: "wrap",
-          alignItems: "center",
-          padding: 10,
-          border: "1px solid #ddd",
-          borderRadius: 10,
-          background: "rgba(255,255,255,0.9)",
-          backdropFilter: "blur(6px)",
-          maxWidth: "min(980px, calc(100vw - 24px))",
-        }}
-      >
-        <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-          Rule
+    <div style={{ fontFamily: "system-ui, sans-serif", padding: 12 }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <label>
+          Rule:&nbsp;
           <input
             type="number"
             min={0}
             max={255}
             value={rule}
             onChange={(e) => setRule(clamp(parseInt(e.target.value || "0", 10), 0, 255))}
-            style={{ width: 84 }}
+            style={{ width: 90 }}
           />
         </label>
 
         <button onClick={() => setRunning((v) => !v)}>{running ? "Pause" : "Play"}</button>
-        <button onClick={() => resetSimulation()}>Reset</button>
+        <button onClick={() => resetSimulation({ random: false })}>Reset (single seed)</button>
+        <button onClick={() => resetSimulation({ random: true })}>Reset (random)</button>
 
         <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
           <input type="checkbox" checked={motionOn} onChange={(e) => setMotionOn(e.target.checked)} />
-          Motion
+          Motion steering
         </label>
 
-        <span style={{ opacity: 0.7 }}>|</span>
-
         <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-          Seed
-          <select value={seedMode} onChange={(e) => setSeedMode(e.target.value)}>
-            <option value="single">Single (centre)</option>
-            <option value="centerSprinkle">Centre + sprinkle</option>
-            <option value="random">Random</option>
+          Fill:&nbsp;
+          <select value={fillMode} onChange={(e) => setFillMode(e.target.value)}>
+            <option value="fit">fit</option>
+            <option value="stretch">stretch</option>
           </select>
         </label>
 
-        {seedMode === "centerSprinkle" && (
-          <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-            Sprinkle
-            <input
-              type="range"
-              min={0}
-              max={0.15}
-              step={0.005}
-              value={sprinkleProb}
-              onChange={(e) => setSprinkleProb(parseFloat(e.target.value))}
-            />
-            <span style={{ width: 48, textAlign: "right" }}>{Math.round(sprinkleProb * 100)}%</span>
-          </label>
-        )}
+        <label style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+          Zoom:&nbsp;
+          <input
+            type="range"
+            min={0.25}
+            max={3}
+            step={0.05}
+            value={zoom}
+            onChange={(e) => setZoom(parseFloat(e.target.value))}
+          />
+          <span style={{ width: 60 }}>{zoom.toFixed(2)}x</span>
+        </label>
+      </div>
 
-        <span style={{ opacity: 0.7 }}>|</span>
-
-        <div style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-          <span style={{ opacity: 0.9 }}>Zoom</span>
-          <button onClick={() => setCellSize((s) => clamp(s + 1, 1, 10))}>+</button>
-          <button onClick={() => setCellSize((s) => clamp(s - 1, 1, 10))}>-</button>
-          <span style={{ width: 48, textAlign: "right" }}>{cellSize}px</span>
-        </div>
-
-        <span style={{ opacity: 0.7 }}>|</span>
-
-        <div style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-          <span style={{ opacity: 0.8 }}>Edge</span>
-          <button onClick={() => setManualEdge(null)} style={{ fontWeight: manualEdge === null ? 700 : 400 }}>
-            Auto
+      <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <span style={{ opacity: 0.8 }}>Manual edge:</span>
+        <button onClick={() => setManualEdge(null)} style={{ fontWeight: manualEdge === null ? 700 : 400 }}>
+          Auto
+        </button>
+        {(["left", "right", "top", "bottom"]).map((e) => (
+          <button key={e} onClick={() => setManualEdge(e)} style={{ fontWeight: manualEdge === e ? 700 : 400 }}>
+            {e}
           </button>
-          {["left", "right", "top", "bottom"].map((e) => (
-            <button key={e} onClick={() => setManualEdge(e)} style={{ fontWeight: manualEdge === e ? 700 : 400 }}>
-              {e}
-            </button>
-          ))}
-        </div>
+        ))}
+      </div>
+
+      <div
+        ref={containerRef}
+        style={{
+          marginTop: 12,
+          border: "1px solid #ddd",
+          width: "100%",
+          height: "70vh", // fills most of the screen
+          display: "block",
+          position: "relative",
+          background: "#fff",
+        }}
+      >
+        <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+      </div>
+
+      <div style={{ marginTop: 10, opacity: 0.85 }}>
+        This version fills the screen by scaling the rendered CA (no shifting, no expanding, no wrap). If you want “more CA
+        world”, increase W/H constants.
       </div>
     </div>
   );
