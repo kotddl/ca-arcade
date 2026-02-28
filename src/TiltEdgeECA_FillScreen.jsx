@@ -376,15 +376,6 @@ export default function TiltEdgeECA_FillScreen() {
       const cw = canvas.width;
       const ch = canvas.height;
 
-      let sxScale = (cw / gw) * zoom;
-      let syScale = (ch / gh) * zoom;
-      const s = Math.max(sxScale, syScale); // COVER (fills screen, crops)
-      sxScale = s;
-      syScale = s;
-
-      const drawW = gw * s;
-      const drawH = gh * s;
-
       // anchor to edge (flush), crop the opposite side
       let dx = 0,
         dy = 0;
@@ -409,7 +400,48 @@ export default function TiltEdgeECA_FillScreen() {
       ctx.fillStyle = "#fff";
       ctx.fillRect(0, 0, cw, ch);
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(off.canvas, 0, 0, gw, gh, dx, dy, drawW, drawH);
+      // --- camera zoom: choose source crop, but always draw full-screen ---
+      const z = zoom; // 0.25 .. 3
+
+      // View window size in source pixels (bigger window = zoomed out)
+      const viewW = clamp(gw / z, 1, gw);
+      const viewH = clamp(gh / z, 1, gh);
+
+      // Center the view window (you could later anchor this to edge if you want)
+      const sx = Math.floor((gw - viewW) / 2);
+      const sy = Math.floor((gh - viewH) / 2);
+
+      // Always cover-scale the DESTINATION (fills screen)
+      const s = Math.max(cw / viewW, ch / viewH);
+      const drawW = viewW * s;
+      const drawH = viewH * s;
+
+      // Use your existing edge-anchoring for dx/dy, but based on drawW/drawH
+      let dx = 0,
+        dy = 0;
+      if (edge === "top") {
+        dx = Math.floor((cw - drawW) / 2);
+        dy = 0;
+      } else if (edge === "bottom") {
+        dx = Math.floor((cw - drawW) / 2);
+        dy = Math.floor(ch - drawH);
+      } else if (edge === "left") {
+        dx = 0;
+        dy = Math.floor((ch - drawH) / 2);
+      } else if (edge === "right") {
+        dx = Math.floor(cw - drawW);
+        dy = Math.floor((ch - drawH) / 2);
+      } else {
+        dx = Math.floor((cw - drawW) / 2);
+        dy = Math.floor((ch - drawH) / 2);
+      }
+
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, cw, ch);
+      ctx.imageSmoothingEnabled = false;
+
+      // Draw cropped source region, scaled to fill screen
+      ctx.drawImage(off.canvas, sx, sy, viewW, viewH, dx, dy, drawW, drawH);
 
       // Optional debug text
       if (hudOpen) {
